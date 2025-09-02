@@ -4,7 +4,7 @@
 // 출력: "M1 tgt/appl / rpm / pwm / Err=±.. | ...  Kp.. Ki.. Kd.. ramp.. slew.. [IRQ/s=..,..,..] | phase=.. t=.."
 
 #include <Arduino.h>
-
+ 
 /* ================= TIMING ================= */
 const float WAIT_SECONDS = 40.0f;
 const float RUN_SECONDS  = 70.0f;
