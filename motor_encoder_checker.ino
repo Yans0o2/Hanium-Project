@@ -1,241 +1,175 @@
-// === 보드 호환: ESP 전용 IRAM_ATTR가 없으면 빈 매크로로 처리 ===
-#ifndef IRAM_ATTR
-#define IRAM_ATTR
-#endif
+// === 3모터 동일 PWM + 엔코더 속도 모니터 (Arduino Mega) === 
+// - 인터럽트: A핀 CHANGE, B핀 상태로 방향 판별(쿼드라처, X2)
+// - 출력: 500ms마다 cps(Counts/s), rpm, dir(F/R)
+// - Mega 외부인터럽트: 2(INT0), 3(INT1), 18(INT5), 19(INT4), 20(INT3), 21(INT2)
 
-/***** 모터 핀맵 (최신) *****/
-// 모터1 (L298N #1)
-const int ENA1  = 10;  // PWM
+// ===== 모터 핀맵 =====
+// 모터1 (L298N #1 단독)
+const int ENA1  = 10;   // PWM
 const int IN1_1 = 22;
 const int IN2_1 = 23;
 
 // 모터2 (L298N #2)
-const int ENB2  = 7;   // PWM
+const int ENB2  = 7;    // PWM
 const int IN3_2 = 26;
 const int IN4_2 = 27;
 
-// 모터3 (L298N #2)  // ⚠ ENA2=5 (3→5로 변경: ENC1_B=3과 충돌 방지)
-const int ENA2  = 5;   // PWM
+// 모터3 (L298N #2)
+// ⚠ 최근 변경: ENA2=5 (ENC1_B=3 충돌 회피)
+const int ENA2  = 5;    // PWM
 const int IN1_2 = 30;
 const int IN2_2 = 31;
 
-/***** 엔코더 핀맵 *****/
-// M1: A=2,  B=3
-// M2: A=19, B=18
-// M3: A=21, B=20
-const int ENC_A[3] = {2, 19, 21};
-const int ENC_B[3] = {3, 18, 20};
+// ===== 엔코더 핀맵 (최근 버전) =====
+// 1모터당: A=인터럽트핀, B=일반 디지털핀
+// A: {2(INT0), 3(INT1), 18(INT5)} / B: {36, 38, 40}
+const int ENC1_A = 2;    // 외부인터럽트
+const int ENC1_B = 36;   // 일반 디지털
+const int ENC2_A = 3;    // 외부인터럽트
+const int ENC2_B = 38;   // 일반 디지털
+const int ENC3_A = 18;   // 외부인터럽트
+const int ENC3_B = 40;   // 일반 디지털
 
-// 엔코더 해상도(카운트/rev)
-const float COUNTS_PER_REV = 600.0f;
+// ===== 설정 =====
+int TEST_PWM = 150;                      // 세 모터 동일 PWM ( -255 ~ +255 )
+const unsigned long INTERVAL_MS = 500;   // 출력 주기(ms)
 
-/***** 출력 주기(속도 샘플링 간격) *****/
-const unsigned long SAMPLE_MS = 500;
+// A핀 CHANGE(X2) 기준 한 바퀴당 카운트 수
+//  COUNTS_PER_REV = PPR(A채널) × 2 × 기어비
+const float COUNTS_PER_REV_1 = 600.0;
+const float COUNTS_PER_REV_2 = 600.0;
+const float COUNTS_PER_REV_3 = 600.0;
 
-/***** 모터별 극성(+1 동일, -1 반대) — 테스트 후 맞춰주세요 *****/
-int kPol[3] = { +1, +1, -1 };  // 예: {+1, -1, +1}
+// ===== 내부 변수 =====
+volatile long encCount1 = 0;
+volatile long encCount2 = 0;
+volatile long encCount3 = 0;
 
-/***** 부팅 시 적용할 기본 PWM (원하면 0으로 시작 후 시리얼에서 s로 설정) *****/
-int pwmCmd[3] = { 120, 120, 120 }; // -255~255
+long lastCount1 = 0, lastCount2 = 0, lastCount3 = 0;
+unsigned long lastPrintMs = 0;
 
-/***** 내부 상태 *****/
-const int EN[3]  = { ENA1, ENB2, ENA2 };
-const int INA[3] = { IN1_1, IN3_2, IN1_2 };
-const int INB[3] = { IN2_1, IN4_2, IN2_2 };
+// ===== 모터 제어 유틸 =====
+void setMotorRaw(int pwmPin, int inA, int inB, int pwmSigned) {
+  int mag = pwmSigned;
+  if (mag < 0) mag = -mag;
+  if (mag > 255) mag = 255;
 
-volatile long encCnt[3] = {0,0,0};  // 누적 카운트
-long prevCnt[3] = {0,0,0};
-unsigned long tPrev = 0;
-
-int clamp255(long v){ return (int)max(-255L, min(255L, v)); }
-
-void writeMotorPWM(int idx, int pwmSigned){
-  int mag = abs(pwmSigned);
-  if (pwmSigned > 0){
-    digitalWrite(INA[idx], HIGH);
-    digitalWrite(INB[idx], LOW);
-  } else if (pwmSigned < 0){
-    digitalWrite(INA[idx], LOW);
-    digitalWrite(INB[idx], HIGH);
+  if (pwmSigned >= 0) {
+    digitalWrite(inA, HIGH);
+    digitalWrite(inB, LOW);
   } else {
-    digitalWrite(INA[idx], LOW);
-    digitalWrite(INB[idx], LOW); // coast
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, HIGH);
   }
-  analogWrite(EN[idx], mag);
+  analogWrite(pwmPin, mag);
 }
 
-void applyAllPWM(){
-  for(int i=0;i<3;i++){
-    int out = clamp255(kPol[i]*pwmCmd[i]);
-    writeMotorPWM(i, out);
+void setMotor(int idx, int pwmSigned) {
+  switch (idx) {
+    case 1: setMotorRaw(ENA1, IN1_1, IN2_1, pwmSigned); break;
+    case 2: setMotorRaw(ENB2, IN3_2, IN4_2, pwmSigned); break;
+    case 3: setMotorRaw(ENA2, IN1_2, IN2_2, pwmSigned); break;
   }
 }
 
-void stopAll(){
-  pwmCmd[0]=pwmCmd[1]=pwmCmd[2]=0;
-  applyAllPWM();
+// ===== 인터럽트 서비스 루틴 (A CHANGE, B로 방향) =====
+void enc1_isr() {
+  int a = digitalRead(ENC1_A);
+  int b = digitalRead(ENC1_B);
+  if (a == b) encCount1++; else encCount1--;
+}
+void enc2_isr() {
+  int a = digitalRead(ENC2_A);
+  int b = digitalRead(ENC2_B);
+  if (a == b) encCount2++; else encCount2--;
+}
+void enc3_isr() {
+  int a = digitalRead(ENC3_A);
+  int b = digitalRead(ENC3_B);
+  if (a == b) encCount3++; else encCount3--;
 }
 
-// ==== ISR 프로토타입 ====
-void IRAM_ATTR enc_isr0();
-void IRAM_ATTR enc_isr1();
-void IRAM_ATTR enc_isr2();
-
-/***** 쿼드러처: A CHANGE, B 읽어 방향판정 *****/
-void IRAM_ATTR enc_isr0(){
-  int a = digitalRead(ENC_A[0]);
-  int b = digitalRead(ENC_B[0]);
-  if (a == b) encCnt[0]++; else encCnt[0]--;
-}
-void IRAM_ATTR enc_isr1(){
-  int a = digitalRead(ENC_A[1]);
-  int b = digitalRead(ENC_B[1]);
-  if (a == b) encCnt[1]++; else encCnt[1]--;
-}
-void IRAM_ATTR enc_isr2(){
-  int a = digitalRead(ENC_A[2]);
-  int b = digitalRead(ENC_B[2]);
-  if (a == b) encCnt[2]++; else encCnt[2]--;
-}
-
-void printHelp(){
-  Serial.println(F("== 3-모터 엔코더 속도 모니터 =="));
-  Serial.println(F("명령:"));
-  Serial.println(F("  s p1 p2 p3   -> 각 모터 PWM 설정 (예: s 120 120 120)"));
-  Serial.println(F("  0            -> 모든 모터 정지"));
-  Serial.println(F("극성 kPol: {+1, -1}로 모터 배선 방향 맞추기"));
-}
-
-void setup(){
+void setup() {
   Serial.begin(115200);
+  while (!Serial) { ; }
 
-  // 핀 설정
-  for(int i=0;i<3;i++){
-    pinMode(EN[i], OUTPUT);
-    pinMode(INA[i], OUTPUT);
-    pinMode(INB[i], OUTPUT);
-    analogWrite(EN[i], 0);           // 안전: EN을 0으로
-    digitalWrite(INA[i], LOW);
-    digitalWrite(INB[i], LOW);
-  }
+  // 모터 핀
+  pinMode(ENA1, OUTPUT);  pinMode(IN1_1, OUTPUT);  pinMode(IN2_1, OUTPUT);
+  pinMode(ENB2, OUTPUT);  pinMode(IN3_2, OUTPUT);  pinMode(IN4_2, OUTPUT);
+  pinMode(ENA2, OUTPUT);  pinMode(IN1_2, OUTPUT);  pinMode(IN2_2, OUTPUT);
 
-  for(int i=0;i<3;i++){
-    pinMode(ENC_A[i], INPUT_PULLUP);
-    pinMode(ENC_B[i], INPUT_PULLUP);
-  }
+  // 엔코더 핀
+  pinMode(ENC1_A, INPUT_PULLUP);  pinMode(ENC1_B, INPUT_PULLUP);
+  pinMode(ENC2_A, INPUT_PULLUP);  pinMode(ENC2_B, INPUT_PULLUP);
+  pinMode(ENC3_A, INPUT_PULLUP);  pinMode(ENC3_B, INPUT_PULLUP);
 
-  // 인터럽트 등록 (A채널 CHANGE)
-  attachInterrupt(digitalPinToInterrupt(ENC_A[0]), enc_isr0, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_A[1]), enc_isr1, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_A[2]), enc_isr2, CHANGE);
+  // 인터럽트 연결 (A핀만 사용)
+  attachInterrupt(digitalPinToInterrupt(ENC1_A), enc1_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC2_A), enc2_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC3_A), enc3_isr, CHANGE);
 
-  printHelp();
+  // 초기 정지
+  setMotor(1, 0); setMotor(2, 0); setMotor(3, 0);
 
-  // ⬇⬇⬇ 핵심: 부팅 시 원하는 PWM을 실제로 적용
-  applyAllPWM();
-
-  tPrev = millis();
+  delay(500);
+  Serial.println(F("== 3-모터 엔코더 속도 모니터 (INT+DIGITAL per motor) =="));
+  Serial.println(F("명령: '+'/'-' PWM±1, '0' 정지, 'r' 역방향 토글"));
 }
 
-void handleSerial(){
-  if(!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if(line.length()==0) return;
-
-  if(line == "0"){
-    stopAll();
-    Serial.println(F("STOP ALL (PWM=0)"));
-    return;
+void loop() {
+  // 런타임 PWM 조정
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '+') { TEST_PWM += 1; if (TEST_PWM > 255) TEST_PWM = 255; }
+    else if (c == '-') { TEST_PWM -= 1; if (TEST_PWM < -255) TEST_PWM = -255; }
+    else if (c == '0') { TEST_PWM = 0; }
+    else if (c == 'r' || c == 'R') { TEST_PWM = -TEST_PWM; }
   }
 
-  if(line[0]=='s' || line[0]=='S'){
-    int p1, p2, p3;
-    if (sscanf(line.c_str()+1, "%d %d %d", &p1, &p2, &p3) == 3){
-      pwmCmd[0]=p1; pwmCmd[1]=p2; pwmCmd[2]=p3;
-      applyAllPWM();
-      Serial.print(F("SET PWM = "));
-      Serial.print(pwmCmd[0]); Serial.print(',');
-      Serial.print(pwmCmd[1]); Serial.print(',');
-      Serial.println(pwmCmd[2]);
-    } else {
-      Serial.println(F("형식: s p1 p2 p3  (예: s 120 120 120)"));
-    }
-    return;
-  }
+  // 동일 PWM 적용 (필요하면 아래 라인만 조정)
+  setMotor(1, TEST_PWM);
+  setMotor(2, TEST_PWM);
+  setMotor(3, TEST_PWM);
 
-  // "120 120 120" 혹은 "120,120,120" 형식도 허용
-  {
-    int p1, p2, p3;
-    if (sscanf(line.c_str(), "%d %d %d", &p1, &p2, &p3) == 3 ||
-        sscanf(line.c_str(), "%d,%d,%d", &p1, &p2, &p3) == 3){
-      pwmCmd[0]=p1; pwmCmd[1]=p2; pwmCmd[2]=p3;
-      applyAllPWM();
-      Serial.print(F("SET PWM = "));
-      Serial.print(pwmCmd[0]); Serial.print(',');
-      Serial.print(pwmCmd[1]); Serial.print(',');
-      Serial.println(pwmCmd[2]);
-      return;
-    }
-  }
-
-  Serial.println(F("알 수 없는 명령. 예: s 120 120 120  또는 0"));
-}
-
-void loop(){
-  handleSerial();
-
+  // 주기 출력
   unsigned long now = millis();
-  if (now - tPrev >= SAMPLE_MS){
-    float dt = (now - tPrev) / 1000.0f;
-    tPrev = now;
+  if (now - lastPrintMs >= INTERVAL_MS) {
+    lastPrintMs = now;
 
-    long c[3];
+    long c1, c2, c3;
     noInterrupts();
-    c[0] = encCnt[0];
-    c[1] = encCnt[1];
-    c[2] = encCnt[2];
+    c1 = encCount1; c2 = encCount2; c3 = encCount3;
     interrupts();
 
-    long d0 = c[0] - prevCnt[0];
-    long d1 = c[1] - prevCnt[1];
-    long d2 = c[2] - prevCnt[2];
-    prevCnt[0] = c[0];
-    prevCnt[1] = c[1];
-    prevCnt[2] = c[2];
+    long d1 = c1 - lastCount1; lastCount1 = c1;
+    long d2 = c2 - lastCount2; lastCount2 = c2;
+    long d3 = c3 - lastCount3; lastCount3 = c3;
 
-    float cps1 = d0 / dt, cps2 = d1 / dt, cps3 = d2 / dt;
-    float rpm1 = cps1 * 60.0f / COUNTS_PER_REV;
-    float rpm2 = cps2 * 60.0f / COUNTS_PER_REV;
-    float rpm3 = cps3 * 60.0f / COUNTS_PER_REV;
+    const float k = 1000.0f / (float)INTERVAL_MS; // ms → s
+    float cps1 = d1 * k, cps2 = d2 * k, cps3 = d3 * k;
 
-    char dir1 = (rpm1>=0)? 'F':'R';
-    char dir2 = (rpm2>=0)? 'F':'R';
-    char dir3 = (rpm3>=0)? 'F':'R';
+    float rpm1 = (COUNTS_PER_REV_1 > 0) ? (cps1 / COUNTS_PER_REV_1 * 60.0f) : 0.0f;
+    float rpm2 = (COUNTS_PER_REV_2 > 0) ? (cps2 / COUNTS_PER_REV_2 * 60.0f) : 0.0f;
+    float rpm3 = (COUNTS_PER_REV_3 > 0) ? (cps3 / COUNTS_PER_REV_3 * 60.0f) : 0.0f;
 
-    int out1 = clamp255(kPol[0]*pwmCmd[0]);
-    int out2 = clamp255(kPol[1]*pwmCmd[1]);
-    int out3 = clamp255(kPol[2]*pwmCmd[2]);
+    char dir1 = (d1 >= 0) ? 'F' : 'R';
+    char dir2 = (d2 >= 0) ? 'F' : 'R';
+    char dir3 = (d3 >= 0) ? 'F' : 'R';
 
-    Serial.print(F("PWM=M1:")); Serial.print(out1);
-    Serial.print(F(" M2:"));     Serial.print(out2);
-    Serial.print(F(" M3:"));     Serial.print(out3);
+    Serial.print(F("PWM=")); Serial.print(TEST_PWM);
+    Serial.print(F(" | M1 cps=")); Serial.print(cps1, 1);
+    Serial.print(F(" rpm=")); Serial.print(rpm1, 1);
+    Serial.print(F(" dir=")); Serial.print(dir1);
 
-    Serial.print(F(" | M1 cps=")); Serial.print(cps1,1);
-    Serial.print(F(" rpm="));      Serial.print(rpm1,1);
-    Serial.print(F(" dir="));      Serial.print(dir1);
+    Serial.print(F(" | M2 cps=")); Serial.print(cps2, 1);
+    Serial.print(F(" rpm=")); Serial.print(rpm2, 1);
+    Serial.print(F(" dir=")); Serial.print(dir2);
 
-    Serial.print(F(" | M2 cps=")); Serial.print(cps2,1);
-    Serial.print(F(" rpm="));      Serial.print(rpm2,1);
-    Serial.print(F(" dir="));      Serial.print(dir2);
+    Serial.print(F(" | M3 cps=")); Serial.print(cps3, 1);
+    Serial.print(F(" rpm=")); Serial.print(rpm3, 1);
+    Serial.print(F(" dir=")); Serial.print(dir3);
 
-    Serial.print(F(" | M3 cps=")); Serial.print(cps3,1);
-    Serial.print(F(" rpm="));      Serial.print(rpm3,1);
-    Serial.print(F(" dir="));      Serial.print(dir3);
-
-    Serial.print(F(" | cnts: "));
-    Serial.print(c[0]); Serial.print(',');
-    Serial.print(c[1]); Serial.print(',');
-    Serial.println(c[2]);
+    Serial.print(F(" | cnts: ")); Serial.print(c1); Serial.print(',');
+    Serial.print(c2); Serial.print(','); Serial.println(c3);
   }
 }
